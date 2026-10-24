@@ -6,13 +6,19 @@ Download IGN LiDAR HD data cropped to each FLAIR-HUB ROI:
   mnt  terrain model, 0.5 m Float32                                    -> .tif (deflate)
   mns  surface model, 0.5 m Float32                                    -> .tif (deflate)
   mnh  canopy height model, 0.5 m Float32 (optional)                   -> .tif (deflate)
+  irc  BD ORTHO infrared false colour (NIR, R, G), 0.2 m Byte          -> .tif (JPEG q95)
 
-Rasters are fetched from the IGN WMS on the native LiDAR HD 0.5 m grid (pixel edges at
+LiDAR rasters are fetched from the IGN WMS on the native LiDAR HD 0.5 m grid (pixel edges at
 .25/.75 m), with the ROI extent snapped outwards, so values are not resampled.
+IRC is fetched on the 0.2 m grid of the FLAIR-HUB patches (same pixel edges as AERIAL_RGBI).
+BD ORTHO is re-flown by department every ~3 years: each ROI uses IRC 2024 when it covers the
+whole ROI, else the most recent fully covering edition (2023, 2022, ...). The edition used is
+written in the GeoTIFF metadata (SOURCE_LAYER) and in <out>/bdortho_irc_layers.csv.
 
 Layout mirrors FLAIR-HUB:
   <out>/D004-2021_LIDARHD_MNT/D004-2021_LIDARHD_MNT_AA-S1-32.tif
   <out>/D004-2021_LIDARHD_LAZ/D004-2021_LIDARHD_LAZ_AA-S1-32.laz
+  <out>/D004-2021_BDORTHO_IRC/D004-2021_BDORTHO_IRC_AA-S1-32.tif
 
 Needs flair_hub_lidar_tiles.csv from lidar_urls.py, plus gdal and pdal on PATH.
 Resumable: existing outputs are skipped. Failures are listed in <out>/failed.txt.
@@ -41,62 +47,111 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from lidar_urls import FLAIR_DATA, OUTPUT, HEADERS, read_rois, tiles_for_bbox, urlopen_retry, human_bytes
 
 WMS_URL = "https://data.geopf.fr/wms-r"
-WMS_LAYERS = {
-    "mnt": "IGNF_LIDAR-HD_MNT_ELEVATION.ELEVATIONGRIDCOVERAGE.LAMB93",
-    "mns": "IGNF_LIDAR-HD_MNS_ELEVATION.ELEVATIONGRIDCOVERAGE.LAMB93",
-    "mnh": "IGNF_LIDAR-HD_MNH_ELEVATION.ELEVATIONGRIDCOVERAGE.LAMB93",
-}
-RES = 0.5
-GRID_OFFSET = 0.25   # LiDAR HD raster pixel edges sit at xxx.25 / xxx.75
 MAX_PX = 4000        # WMS refuses WIDTH/HEIGHT above 5000
-GTIFF_OPTS = ["-co", "COMPRESS=DEFLATE", "-co", "PREDICTOR=3", "-co", "TILED=YES", "-co", "BIGTIFF=IF_SAFER"]
+FLOAT_OPTS = ["-co", "COMPRESS=DEFLATE", "-co", "PREDICTOR=3", "-co", "TILED=YES", "-co", "BIGTIFF=IF_SAFER"]
+JPEG_OPTS = ["-co", "COMPRESS=JPEG", "-co", "PHOTOMETRIC=YCBCR", "-co", "JPEG_QUALITY=95",
+             "-co", "TILED=YES", "-co", "BIGTIFF=IF_SAFER"]
+IRC_LAYERS = [f"ORTHOIMAGERY.ORTHOPHOTOS.IRC.{y}" for y in (2024, 2023, 2022, 2021, 2020)]
+# layers: candidates in order of preference; offset: where pixel edges sit on the res grid
+RASTERS = {
+    "mnt": {"layers": ["IGNF_LIDAR-HD_MNT_ELEVATION.ELEVATIONGRIDCOVERAGE.LAMB93"],
+            "res": 0.5, "offset": 0.25, "opts": FLOAT_OPTS, "tag": "LIDARHD"},
+    "mns": {"layers": ["IGNF_LIDAR-HD_MNS_ELEVATION.ELEVATIONGRIDCOVERAGE.LAMB93"],
+            "res": 0.5, "offset": 0.25, "opts": FLOAT_OPTS, "tag": "LIDARHD"},
+    "mnh": {"layers": ["IGNF_LIDAR-HD_MNH_ELEVATION.ELEVATIONGRIDCOVERAGE.LAMB93"],
+            "res": 0.5, "offset": 0.25, "opts": FLOAT_OPTS, "tag": "LIDARHD"},
+    "irc": {"layers": IRC_LAYERS, "res": 0.2, "offset": 0.0, "opts": JPEG_OPTS, "tag": "BDORTHO"},
+}
+_log_lock = threading.Lock()
 
 
-def snap_bbox(xmin, ymin, xmax, ymax):
-    lo = lambda v: math.floor((v - GRID_OFFSET) / RES) * RES + GRID_OFFSET
-    hi = lambda v: math.ceil((v - GRID_OFFSET) / RES) * RES + GRID_OFFSET
+def snap_bbox(xmin, ymin, xmax, ymax, res=0.5, offset=0.25):
+    lo = lambda v: round(math.floor(round((v - offset) / res, 6)) * res + offset, 6)
+    hi = lambda v: round(math.ceil(round((v - offset) / res, 6)) * res + offset, 6)
     return lo(xmin), lo(ymin), hi(xmax), hi(ymax)
 
 
 def out_path(out, roi, prod):
     dom_year, name = roi.split("_", 1)            # D004-2021, AA-S1-32
     ext = "laz" if prod == "laz" else "tif"
-    tag = f"{dom_year}_LIDARHD_{prod.upper()}"
+    tag = f"{dom_year}_{RASTERS.get(prod, {}).get('tag', 'LIDARHD')}_{prod.upper()}"
     return os.path.join(out, tag, f"{tag}_{name}.{ext}")
 
 
-def fetch_raster(prod, bbox, dest):
-    xmin, ymin, xmax, ymax = snap_bbox(*bbox)
-    step = MAX_PX * RES
+def wms_getmap(layer, bbox, width, height, path):
+    params = {
+        "SERVICE": "WMS", "VERSION": "1.3.0", "REQUEST": "GetMap", "EXCEPTIONS": "text/xml",
+        "LAYERS": layer, "STYLES": "", "FORMAT": "image/geotiff", "CRS": "EPSG:2154",
+        "BBOX": ",".join(map(str, bbox)), "WIDTH": width, "HEIGHT": height,
+    }
+    with urlopen_retry(urllib.request.Request(WMS_URL + "?" + urllib.parse.urlencode(params),
+                                              headers=HEADERS)) as r:
+        if "tiff" not in r.headers.get("Content-Type", ""):
+            raise RuntimeError(f"WMS error: {r.read(500)!r}")
+        with open(path, "wb") as fh:
+            shutil.copyfileobj(r, fh)
+
+
+def valid_percent(path):
+    info = json.loads(subprocess.run(["gdalinfo", "-json", "-stats", path],
+                                     check=True, capture_output=True, text=True).stdout)
+    md = info["bands"][0].get("metadata", {}).get("", {})
+    return float(md.get("STATISTICS_VALID_PERCENT", 0))
+
+
+def pick_layer(layers, bbox, tmp):
+    """First layer covering the whole bbox (checked on a coarse preview), else the best covering one."""
+    if len(layers) == 1:
+        return layers[0], None
+    best = (None, -1.0)
+    w = 256
+    h = max(1, round(w * (bbox[3] - bbox[1]) / (bbox[2] - bbox[0])))
+    for layer in layers:
+        path = os.path.join(tmp, "probe.tif")
+        wms_getmap(layer, bbox, w, h, path)
+        pct = valid_percent(path)
+        if pct >= 99.9:
+            return layer, pct
+        if pct > best[1]:
+            best = (layer, pct)
+    if best[1] <= 0:
+        raise RuntimeError("no coverage in any edition")
+    return best
+
+
+def fetch_raster(prod, roi, bbox, dest, log_dir):
+    spec = RASTERS[prod]
+    res = spec["res"]
+    xmin, ymin, xmax, ymax = snap_bbox(*bbox, res=res, offset=spec["offset"])
+    step = MAX_PX * res
     with tempfile.TemporaryDirectory(dir=os.path.dirname(dest)) as tmp:
+        layer, pct = pick_layer(spec["layers"], (xmin, ymin, xmax, ymax), tmp)
         blocks = []
         y = ymin
         while y < ymax - 1e-6:
-            y2 = min(y + step, ymax)
+            y2 = round(min(y + step, ymax), 6)
             x = xmin
             while x < xmax - 1e-6:
-                x2 = min(x + step, xmax)
-                params = {
-                    "SERVICE": "WMS", "VERSION": "1.3.0", "REQUEST": "GetMap", "EXCEPTIONS": "text/xml",
-                    "LAYERS": WMS_LAYERS[prod], "STYLES": "", "FORMAT": "image/geotiff", "CRS": "EPSG:2154",
-                    "BBOX": f"{x},{y},{x2},{y2}",
-                    "WIDTH": round((x2 - x) / RES), "HEIGHT": round((y2 - y) / RES),
-                }
-                with urlopen_retry(urllib.request.Request(WMS_URL + "?" + urllib.parse.urlencode(params),
-                                                          headers=HEADERS)) as r:
-                    if "tiff" not in r.headers.get("Content-Type", ""):
-                        raise RuntimeError(f"WMS error: {r.read(500)!r}")
-                    path = os.path.join(tmp, f"b{len(blocks)}.tif")
-                    with open(path, "wb") as fh:
-                        shutil.copyfileobj(r, fh)
+                x2 = round(min(x + step, xmax), 6)
+                path = os.path.join(tmp, f"b{len(blocks)}.tif")
+                wms_getmap(layer, (x, y, x2, y2), round((x2 - x) / res), round((y2 - y) / res), path)
                 blocks.append(path)
                 x = x2
             y = y2
         vrt = os.path.join(tmp, "m.vrt")
         subprocess.run(["gdalbuildvrt", "-q", vrt, *blocks], check=True)
         part = dest + ".part.tif"
-        subprocess.run(["gdal_translate", "-q", "-a_srs", "EPSG:2154", *GTIFF_OPTS, vrt, part], check=True)
+        subprocess.run(["gdal_translate", "-q", "-a_srs", "EPSG:2154", *spec["opts"],
+                        "-mo", f"SOURCE_LAYER={layer}", vrt, part], check=True)
         os.replace(part, dest)
+    if pct is not None:
+        log = os.path.join(log_dir, f"{RASTERS[prod]['tag'].lower()}_{prod}_layers.csv")
+        with _log_lock:
+            new = not os.path.exists(log)
+            with open(log, "a") as fh:
+                if new:
+                    fh.write("ROI_id,layer,valid_percent\n")
+                fh.write(f"{roi},{layer},{pct:.2f}\n")
 
 
 class TileCache:
@@ -168,7 +223,7 @@ def main():
     ap.add_argument("--data", default=FLAIR_DATA, help="FLAIR-HUB data dir (contains GLOBAL_ALL_MTD.zip)")
     ap.add_argument("--tiles", default=os.path.join(OUTPUT, "flair_hub_lidar_tiles.csv"))
     ap.add_argument("--out", default=os.path.join(os.path.dirname(FLAIR_DATA), "data_lidar"))
-    ap.add_argument("--products", nargs="+", default=["laz", "mnt", "mns"], choices=["laz", "mnt", "mns", "mnh"])
+    ap.add_argument("--products", nargs="+", default=["laz", "mnt", "mns"], choices=["laz", *RASTERS])
     ap.add_argument("--domains", nargs="*", help="restrict to domains, e.g. D004 D024047")
     ap.add_argument("--rois", nargs="*", help="restrict to ROI ids")
     ap.add_argument("--limit", type=int, help="only the first N ROIs (testing)")
@@ -212,7 +267,7 @@ def main():
                 raise RuntimeError("no LiDAR HD tile available")
             fetch_laz(bbox, roi_laz_tiles[roi], cache, dest)
         else:
-            fetch_raster(prod, bbox, dest)
+            fetch_raster(prod, roi, bbox, dest, args.out)
         return os.path.getsize(dest)
 
     failed, total, t0 = [], 0, time.time()

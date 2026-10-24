@@ -5,6 +5,7 @@ Package downloaded IGN data into the Hugging Face dataset repo, mirroring FLAIR-
   <hf>/data/D004-2021_LIDARHD_MNT.zip
         D004-2021_LIDARHD_MNT/AA-S1-32/D004-2021_LIDARHD_MNT_AA-S1-32.tif
   <hf>/data/D004-2021_LIDARHD_LAZ.zip     (same for MNS)
+  <hf>/data/D004-2021_BDORTHO_IRC.zip
   <hf>/data/GLOBAL_VECTORS.zip            FLAIR-HUB_CLC18.gpkg, FLAIR-HUB_VEGETATION.gpkg, ...
   <hf>/metadata/                          tile index, ROI -> tile mapping, summary, failures
   <hf>/LICENSES/                          copied from this repo
@@ -30,7 +31,7 @@ from lidar_urls import FLAIR_DATA, OUTPUT, read_rois, human_bytes
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(FLAIR_DATA)
-DIR_RE = re.compile(r"^(D\d+-\d{4})_LIDARHD_(LAZ|MNT|MNS|MNH)$")
+DIR_RE = re.compile(r"^(D\d+-\d{4})_(?:LIDARHD_(LAZ|MNT|MNS|MNH)|BDORTHO_(IRC))$")
 
 
 def failures(src):
@@ -83,7 +84,7 @@ def main():
         m = DIR_RE.match(d)
         if not m or (args.domains and m.group(1).split("-")[0] not in args.domains):
             continue
-        dom_year, prod = m.groups()
+        dom_year, prod = m.group(1), m.group(2) or m.group(3)
         dest = os.path.join(data_dir, f"{d}.zip")
         if os.path.exists(dest):
             continue
@@ -92,7 +93,7 @@ def main():
                  if not f.startswith(".") and ".part." not in f and not f.startswith("tmp")}
         present = {f"{dom_year}_{f.rsplit('_', 1)[1].rsplit('.', 1)[0]}" for f in files}
         missing = sorted(r for r in expected[dom_year] - present
-                         if (r, prod.lower()) not in fails or "no LiDAR HD tile" not in fails[(r, prod.lower())])
+                         if not any(k in fails.get((r, prod.lower()), "") for k in ("no LiDAR HD tile", "no coverage")))
         if missing and not args.force:
             print(f"skip {d}: {len(missing)} ROIs not downloaded yet (e.g. {missing[0]})", file=sys.stderr)
             continue
@@ -123,11 +124,14 @@ def main():
         os.makedirs(meta, exist_ok=True)
         for f in ("flair_hub_lidar_tiles.csv", "flair_hub_lidar_roi_tiles.csv", "flair_hub_lidar_summary.json"):
             shutil.copy2(os.path.join(OUTPUT, f), meta)
+        irc_log = os.path.join(args.lidar, "bdortho_irc_layers.csv")
+        if os.path.exists(irc_log):
+            shutil.copy2(irc_log, meta)
         for src, name in ((args.lidar, "failed_lidar.txt"), (args.vectors, "failed_vectors.txt")):
             if os.path.exists(os.path.join(src, name.replace("_lidar", ""))):
                 shutil.copy2(os.path.join(src, name.replace("_lidar", "")), os.path.join(meta, name))
         shutil.copytree(os.path.join(HERE, "LICENSES"), os.path.join(args.hf, "LICENSES"), dirs_exist_ok=True)
-    print(f"{'would write' if args.dry_run else 'wrote'} {human_bytes(total)} of LiDAR zips -> {data_dir}")
+    print(f"{'would write' if args.dry_run else 'wrote'} {human_bytes(total)} of raster / LAZ zips -> {data_dir}")
 
 
 if __name__ == "__main__":
