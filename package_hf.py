@@ -66,6 +66,7 @@ def main():
     ap.add_argument("--vectors", default=os.path.join(ROOT, "data_vectors"))
     ap.add_argument("--hf", default=os.path.join(os.path.dirname(ROOT), "FLAIR-HUB-LIDARHD"))
     ap.add_argument("--domains", nargs="*", help="restrict to domains, e.g. D004 D024047")
+    ap.add_argument("--products", nargs="*", help="restrict to products, e.g. MNT MNS IRC LAZ")
     ap.add_argument("--force", action="store_true", help="package incomplete domain/products too")
     ap.add_argument("--delete-source", action="store_true", help="delete source files after zipping")
     ap.add_argument("--dry-run", action="store_true")
@@ -85,6 +86,8 @@ def main():
         if not m or (args.domains and m.group(1).split("-")[0] not in args.domains):
             continue
         dom_year, prod = m.group(1), m.group(2) or m.group(3)
+        if args.products and prod not in [p.upper() for p in args.products]:
+            continue
         dest = os.path.join(data_dir, f"{d}.zip")
         if os.path.exists(dest):
             continue

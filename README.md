@@ -50,6 +50,7 @@ They enrich every one of the 2,822 [FLAIR-HUB](https://huggingface.co/datasets/I
 | `download_lidar.py` | Point clouds, MNT / MNS / MNH and IRC orthophotos cropped to each ROI |
 | `download_vectors.py` | Corine Land Cover and vegetation polygons clipped to each ROI |
 | `package_hf.py` | Zips per domain and product (FLAIR-HUB layout), metadata and licences for Hugging Face |
+| `upload_hf.sh` | Uploads the packaged folder to the Hub |
 
 ## Quick start
 
@@ -138,9 +139,11 @@ Use `--domains D004 D013` or `--limit 3` to try a subset.
 
 ## Publishing
 
-On exFAT / external drives macOS creates `._*` files, so exclude them when uploading:
-
 ```bash
 hf auth login
-hf upload SylvainSouche/FLAIR-HUB-LiDAR-HD /path/to/FLAIR-HUB-LIDARHD . --repo-type dataset --exclude "._*" --exclude "**/._*"
+python3 package_hf.py --products MNT MNS      # or no --products for everything complete
+./upload_hf.sh                                # dot_clean + hf upload, skips unchanged files
 ```
+
+`upload_hf.sh` removes the `._*` files macOS writes on exFAT / external drives and excludes
+partially written zips.
