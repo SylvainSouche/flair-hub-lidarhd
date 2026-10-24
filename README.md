@@ -88,6 +88,6 @@ FLAIR-HUB). On exFAT / external drives, macOS creates `._*` files, so exclude th
 
 ```bash
 hf auth login
-hf repo create <user>/FLAIR-HUB-LiDAR-HD --repo-type dataset
-hf upload-large-folder <user>/FLAIR-HUB-LiDAR-HD /path/to/FLAIR-HUB-LIDARHD --repo-type dataset --exclude "._*" "**/._*"
+hf repos create <user>/FLAIR-HUB-LiDAR-HD --repo-type dataset --private
+hf upload <user>/FLAIR-HUB-LiDAR-HD /path/to/FLAIR-HUB-LIDARHD . --repo-type dataset --exclude "._*" --exclude "**/._*"
 ```
