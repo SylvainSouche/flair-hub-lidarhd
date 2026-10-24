@@ -1,0 +1,8 @@
+name: flair-ign
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.9
+  - gdal>=3.6
+  - pdal>=2.6
+  - huggingface_hub   # only for uploading the packaged dataset
