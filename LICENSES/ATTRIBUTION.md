@@ -1,7 +1,8 @@
 # Data sources, licences and attribution
 
 All data were downloaded from the IGN Géoplateforme (data.geopf.fr) and cropped / clipped to the
-extents of the FLAIR-HUB ROIs (2,822 ROIs, Lambert-93 / EPSG:2154).
+extents of the FLAIR-HUB ROIs (2,822 ROIs, Lambert-93 / EPSG:2154), except the OpenStreetMap layers,
+queried from the Overpass API.
 
 | Product | Producer | Source service | Licence | Last update of the source |
 |---|---|---|---|---|
@@ -11,6 +12,7 @@ extents of the FLAIR-HUB ROIs (2,822 ROIs, Lambert-93 / EPSG:2154).
 | BD ORTHO infrarouge couleur (IRC), 0.2 m — edition 2024, else most recent covering edition | IGN | WMS-R `ORTHOIMAGERY.ORTHOPHOTOS.IRC.<year>` | Licence Ouverte 2.0 | per ROI, edition in `metadata/bdortho_irc_layers.csv` and the GeoTIFF tag `SOURCE_LAYER` |
 | BD France TOPO – thème végétation (beta) | IGN; aggregates OCS GE, BD TOPO, Masque Forêt-Lande (IGN) and RPG (ASP / IGN) | WFS `IGNF_BD-FRANCE-TOPO-VEGETATION:BD-FRANCE-TOPO-VEGETATION` | Licence Ouverte 2.0 | per polygon, `millesime` + `source` columns (2021–2024) |
 | Corine Land Cover 2018 (FR) | EEA / Copernicus CLMS, SDES | WFS `LANDCOVER.CLC18_FR:clc18_fr` | Copernicus data policy (free, full and open) | 2018 edition |
+| OpenStreetMap land cover (`natural`, `landuse`, `wetland`, `leisure`) and lines (hedges, tree rows, cliffs) | OpenStreetMap contributors | Overpass API (`overpass-api.de`) | **ODbL 1.0** (share-alike), separate zip `GLOBAL_OSM.zip` | live OSM, extracted 2026-10 |
 | FLAIR-HUB ROI geometry (used to crop) | IGN | huggingface.co/datasets/IGNF/FLAIR-HUB | Licence Ouverte 2.0 | FLAIR-HUB release |
 
 LiDAR acquisition dates range from 2021-04 to 2026-03 (`date_debut_acquisition` /
@@ -22,6 +24,7 @@ LiDAR acquisition dates range from 2021-04 to 2026-03 (`date_debut_acquisition` 
   [OPEN-LICENCE-2.0-EN.md](OPEN-LICENCE-2.0-EN.md) (English translation).
   Source: <https://github.com/etalab/licence-ouverte>. Compatible with CC-BY 2.0+ and ODC-BY.
 - Copernicus: [COPERNICUS-CLMS.md](COPERNICUS-CLMS.md).
+- OpenStreetMap: [OPENSTREETMAP.md](OPENSTREETMAP.md) and the [ODbL 1.0 text](ODbL-1.0.md).
 
 ## Attribution notice to reuse
 
@@ -29,5 +32,6 @@ LiDAR acquisition dates range from 2021-04 to 2026-03 (`date_debut_acquisition` 
 > IGN, downloaded 2026-10 from data.geopf.fr; last update dates per tile / polygon in the metadata.
 > © European Union, Copernicus Land Monitoring Service 2018, European Environment Agency (EEA) —
 > Corine Land Cover 2018, SDES.
+> OpenStreetMap layers: © OpenStreetMap contributors, ODbL 1.0.
 > Modified: cropped / clipped to FLAIR-HUB ROI extents, rasters recompressed (DEFLATE), point clouds
 > cropped and re-encoded as LAZ 1.4, orthophotos re-encoded as JPEG-compressed GeoTIFF.

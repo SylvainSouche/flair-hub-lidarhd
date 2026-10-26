@@ -32,7 +32,7 @@ The dataset produced here is published on Hugging Face:
 ## What the scripts do
 
 They enrich every one of the 2,822 [FLAIR-HUB](https://huggingface.co/datasets/IGNF/FLAIR-HUB) ROIs
-(2,528 km² across 74 French domains, Lambert-93) with IGN open data, cropped to the ROI:
+(2,528 km² across 74 French domains, Lambert-93) with IGN open data and OpenStreetMap, cropped to the ROI:
 
 | Product | Source | Output per ROI |
 |---|---|---|
@@ -43,12 +43,15 @@ They enrich every one of the 2,822 [FLAIR-HUB](https://huggingface.co/datasets/I
 | BD ORTHO IRC (NIR-R-G), 2024 or latest covering edition | WMS-R, 0.2 m FLAIR-HUB grid | Byte GeoTIFF, JPEG q95 |
 | Corine Land Cover 2018 (→ 2012 → 2006 fallback) | WFS | polygons clipped to the ROI |
 | BD France TOPO végétation (IGN beta, partial coverage) | WFS | polygons clipped to the ROI |
+| OpenStreetMap land cover (`natural`, `landuse`, `wetland`, `leisure`) + hedges, tree rows, cliffs | Overpass API | polygons / lines clipped to the ROI, plus per-ROI coverage share |
 
 | Script | Role |
 |---|---|
 | `lidar_urls.py` | Index of the LiDAR HD tiles covering the ROIs: download URLs, point counts, sizes, dates |
 | `download_lidar.py` | Point clouds, MNT / MNS / MNH and IRC orthophotos cropped to each ROI |
 | `download_vectors.py` | Corine Land Cover and vegetation polygons clipped to each ROI |
+| `download_osm.py` | OpenStreetMap land cover and lines from the Overpass API, clipped to each ROI |
+| `resume.sh` | Reports what is missing, verifies files on disk, re-fetches broken or missing ones |
 | `package_hf.py` | Zips per domain and product (FLAIR-HUB layout), metadata and licences for Hugging Face |
 | `upload_hf.sh` | Uploads the packaged folder to the Hub |
 
@@ -79,6 +82,7 @@ python3 download_lidar.py --products laz
 
 # 3. Vector layers -> $FLAIR_HUB_DATA/../data_vectors/
 python3 download_vectors.py
+python3 download_osm.py          # Overpass, ~25 ROIs per request; set OVERPASS_URL for another instance
 
 # 4. Package for Hugging Face
 python3 package_hf.py --dry-run
@@ -86,6 +90,9 @@ python3 package_hf.py --delete-source
 ```
 
 Every step is resumable: re-running skips finished files, and failures are listed in `failed*.txt`.
+`python3 download_lidar.py --products irc --dry-run` reports what is missing and the volume to download;
+`--check-existing` re-reads every file on disk and re-fetches the broken ones; `./resume.sh` does both
+for every product.
 Use `--domains D004 D013` or `--limit 3` to try a subset.
 
 ## How the data are cropped
@@ -105,6 +112,12 @@ Use `--domains D004 D013` or `--limit 3` to try a subset.
   remote COPC range reads much slower than whole-tile downloads.
 - **Vectors** are clipped to the ROI extent and merged into one GeoPackage per layer, with `ROI_id`
   and `domain` columns.
+- **OpenStreetMap** is queried from the Overpass API with one bounding-box statement per ROI, ~25 ROIs
+  per request, so only data inside the ROIs is transferred (well under 1 GB in total). Multipolygons
+  are assembled by GDAL's OSM driver with [`config/osmconf_landcover.ini`](config/osmconf_landcover.ini),
+  which turns land-cover tags (`natural`, `landuse`, `wetland`, `leaf_type`, `crop`, ...) into columns.
+  `osm_coverage.csv` gives, per ROI, the share of the ROI covered by OSM land-cover polygons, a proxy
+  for how completely the area is mapped. OSM is the live 2026 state, not the imagery date.
 
 ### Volumes (all 2,822 ROIs)
 
@@ -122,9 +135,10 @@ Use `--domains D004 D013` or `--limit 3` to try a subset.
 - [x] LiDAR HD tile index for the FLAIR-HUB ROIs
 - [x] MNT / MNS per ROI
 - [x] Corine Land Cover 2018 and IGN vegetation polygons per ROI
-- [ ] IRC orthophotos per ROI (running)
-- [ ] LiDAR point clouds per ROI (running, ~1 day)
-- [ ] Hugging Face upload of every product
+- [x] IRC orthophotos per ROI
+- [ ] OpenStreetMap land cover per ROI (script ready, download pending)
+- [ ] LiDAR point clouds per ROI (2,384 / 2,706 covered ROIs done)
+- [ ] Hugging Face upload of every product (MNT, MNS, vectors done; IRC uploading)
 - [ ] Training targets: Corine classes rasterised on the FLAIR-HUB grid, reconciled with FLAIR-HUB labels
 - [ ] Land-cover classification model (imagery + NIR + LiDAR height)
 - [ ] Cartographic rendering pipeline (relief shading, land-cover generalisation, IGN / swisstopo-like style)
@@ -132,10 +146,12 @@ Use `--domains D004 D013` or `--limit 3` to try a subset.
 ## Licences
 
 - **Code**: MIT, see [LICENSE](LICENSE).
-- **Data**:
+- **Data** (all redistributable with attribution):
   - IGN products (LiDAR HD, BD ORTHO, BD France TOPO, FLAIR-HUB) are under Licence Ouverte 2.0.
   - Corine Land Cover is under the Copernicus data policy.
   - Sources, required attribution and the licence texts are in [LICENSES/ATTRIBUTION.md](LICENSES/ATTRIBUTION.md).
+  - OpenStreetMap layers are © OpenStreetMap contributors under ODbL 1.0 (share-alike). They are
+    shipped in a separate zip with their own licence; see [LICENSES/OPENSTREETMAP.md](LICENSES/OPENSTREETMAP.md).
 
 ## Publishing
 

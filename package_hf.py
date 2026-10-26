@@ -7,6 +7,7 @@ Package downloaded IGN data into the Hugging Face dataset repo, mirroring FLAIR-
   <hf>/data/D004-2021_LIDARHD_LAZ.zip     (same for MNS)
   <hf>/data/D004-2021_BDORTHO_IRC.zip
   <hf>/data/GLOBAL_VECTORS.zip            FLAIR-HUB_CLC18.gpkg, FLAIR-HUB_VEGETATION.gpkg, ...
+  <hf>/data/GLOBAL_OSM.zip                OpenStreetMap land cover + lines (ODbL), osm_coverage.csv
   <hf>/metadata/                          tile index, ROI -> tile mapping, summary, failures
   <hf>/LICENSES/                          copied from this repo
 
@@ -110,17 +111,25 @@ def main():
         if args.delete_source:
             shutil.rmtree(src)
 
-    # Vectors: small, one zip for all of them
-    vec_zip = os.path.join(data_dir, "GLOBAL_VECTORS.zip")
+    # Vectors: small, one zip per licence. OSM (ODbL, share-alike) is kept apart from the
+    # IGN / Copernicus layers and carries its licence text inside the zip.
     gpkgs = sorted(f for f in os.listdir(args.vectors)
                    if f.startswith("FLAIR-HUB_") and f.endswith(".gpkg") and ".part." not in f)
-    # rebuilt whenever a GeoPackage is newer than the zip (e.g. a layer finished merging later)
-    stale = not os.path.exists(vec_zip) or any(
-        os.path.getmtime(os.path.join(args.vectors, f)) > os.path.getmtime(vec_zip) for f in gpkgs)
-    if gpkgs and stale:
-        print(f"GLOBAL_VECTORS.zip  {', '.join(gpkgs)}")
-        if not args.dry_run:
-            write_zip([(f"GLOBAL_VECTORS/{f}", os.path.join(args.vectors, f)) for f in gpkgs], vec_zip)
+    osm = [f for f in gpkgs if f.startswith("FLAIR-HUB_OSM_")]
+    groups = {
+        "GLOBAL_VECTORS": [(f, os.path.join(args.vectors, f)) for f in gpkgs if f not in osm],
+        "GLOBAL_OSM": [(f, os.path.join(args.vectors, f)) for f in osm] + (
+            [("osm_coverage.csv", os.path.join(args.vectors, "osm_coverage.csv")),
+             ("LICENSE-ODbL-1.0.md", os.path.join(HERE, "LICENSES", "ODbL-1.0.md"))] if osm else []),
+    }
+    for name, members in groups.items():
+        dest = os.path.join(data_dir, f"{name}.zip")
+        # rebuilt whenever a member is newer than the zip (e.g. a layer finished merging later)
+        stale = not os.path.exists(dest) or any(os.path.getmtime(p) > os.path.getmtime(dest) for _, p in members)
+        if members and stale:
+            print(f"{name}.zip  {', '.join(f for f, _ in members)}")
+            if not args.dry_run:
+                write_zip([(f"{name}/{f}", p) for f, p in members], dest)
 
     if not args.dry_run:
         meta = os.path.join(args.hf, "metadata")
