@@ -27,6 +27,9 @@ Usage:
   python3 download_lidar.py                        # laz, mnt, mns for every ROI
   python3 download_lidar.py --products mnt mns --domains D004
   python3 download_lidar.py --limit 3              # quick test
+  python3 download_lidar.py --products irc --dry-run          # what is missing, volume to download
+  python3 download_lidar.py --products irc --check-existing   # verify files, re-fetch broken ones
+  ./resume.sh                                                 # all of the above, every product
 """
 import argparse
 import csv
@@ -88,8 +91,46 @@ def wms_getmap(layer, bbox, width, height, path):
                                               headers=HEADERS)) as r:
         if "tiff" not in r.headers.get("Content-Type", ""):
             raise RuntimeError(f"WMS error: {r.read(500)!r}")
+        expected = int(r.headers.get("Content-Length") or 0)
         with open(path, "wb") as fh:
             shutil.copyfileobj(r, fh)
+    if expected and os.path.getsize(path) != expected:
+        raise RuntimeError(f"truncated response: {os.path.getsize(path)} of {expected} bytes")
+
+
+def check_raster(path, width=None, height=None):
+    """Read every pixel (gdalinfo -checksum) and check the size. Returns an error message or None."""
+    p = subprocess.run(["gdalinfo", "-json", "-checksum", path], capture_output=True, text=True)
+    if p.returncode != 0 or "ERROR" in p.stderr:
+        return f"unreadable: {(p.stderr.strip() or 'gdalinfo failed')[-200:]}"
+    size = json.loads(p.stdout)["size"]
+    if width and size != [width, height]:
+        return f"size {size} != {[width, height]}"
+    return None
+
+
+def fetch_block(layer, bbox, width, height, tmp, name, retries=5):
+    """One WMS block, verified and re-georeferenced from the requested bbox. Returns a VRT path.
+
+    IGN's WMS occasionally answers 400, truncates a response or writes a broken SRS in the
+    GeoTIFF header; all three are retried, and the georeferencing is taken from the request.
+    """
+    raw, vrt = os.path.join(tmp, f"{name}.tif"), os.path.join(tmp, f"{name}.vrt")
+    for attempt in range(retries):
+        try:
+            wms_getmap(layer, bbox, width, height, raw)
+            err = check_raster(raw, width, height)
+            if err:
+                raise RuntimeError(err)
+            x, y, x2, y2 = bbox
+            subprocess.run(["gdal_translate", "-q", "-of", "VRT", "-a_srs", "EPSG:2154",
+                            "-a_ullr", str(x), str(y2), str(x2), str(y), raw, vrt],
+                           check=True, capture_output=True)
+            return vrt
+        except Exception:
+            if attempt == retries - 1:
+                raise
+            time.sleep(10 * 2 ** attempt)
 
 
 def valid_percent(path):
@@ -106,10 +147,8 @@ def pick_layer(layers, bbox, tmp):
     best = (None, -1.0)
     w = 256
     h = max(1, round(w * (bbox[3] - bbox[1]) / (bbox[2] - bbox[0])))
-    for layer in layers:
-        path = os.path.join(tmp, "probe.tif")
-        wms_getmap(layer, bbox, w, h, path)
-        pct = valid_percent(path)
+    for i, layer in enumerate(layers):
+        pct = valid_percent(fetch_block(layer, bbox, w, h, tmp, f"probe{i}"))
         if pct >= 99.9:
             return layer, pct
         if pct > best[1]:
@@ -133,16 +172,22 @@ def fetch_raster(prod, roi, bbox, dest, log_dir):
             x = xmin
             while x < xmax - 1e-6:
                 x2 = round(min(x + step, xmax), 6)
-                path = os.path.join(tmp, f"b{len(blocks)}.tif")
-                wms_getmap(layer, (x, y, x2, y2), round((x2 - x) / res), round((y2 - y) / res), path)
-                blocks.append(path)
+                blocks.append(fetch_block(layer, (x, y, x2, y2), round((x2 - x) / res),
+                                          round((y2 - y) / res), tmp, f"b{len(blocks)}"))
                 x = x2
             y = y2
         vrt = os.path.join(tmp, "m.vrt")
-        subprocess.run(["gdalbuildvrt", "-q", vrt, *blocks], check=True)
+        p = subprocess.run(["gdalbuildvrt", vrt, *blocks], capture_output=True, text=True)
+        if p.returncode != 0 or "Skipping" in p.stderr:
+            raise RuntimeError(f"mosaic failed: {p.stderr.strip()[-300:]}")
         part = dest + ".part.tif"
         subprocess.run(["gdal_translate", "-q", "-a_srs", "EPSG:2154", *spec["opts"],
                         "-mo", f"SOURCE_LAYER={layer}", vrt, part], check=True)
+        # final check: a skipped block would leave the mosaic short or with holes
+        err = check_raster(part, round((xmax - xmin) / res), round((ymax - ymin) / res))
+        if err:
+            os.remove(part)
+            raise RuntimeError(f"output check failed: {err}")
         os.replace(part, dest)
     if pct is not None:
         log = os.path.join(log_dir, f"{RASTERS[prod]['tag'].lower()}_{prod}_layers.csv")
@@ -218,6 +263,58 @@ def fetch_laz(bbox, tiles, cache, dest):
             cache.release(t)
 
 
+def raster_shape(prod, bbox):
+    spec = RASTERS[prod]
+    xmin, ymin, xmax, ymax = snap_bbox(*bbox, res=spec["res"], offset=spec["offset"])
+    return round((xmax - xmin) / spec["res"]), round((ymax - ymin) / spec["res"])
+
+
+def check_existing(roi_ids, rois, products, out, workers):
+    """Verify files already downloaded; delete the broken ones so this run fetches them again."""
+    def check(roi, prod, dest):
+        if prod == "laz":
+            # header + VLRs only (a full read of ~300 GB of LAZ would take hours)
+            p = subprocess.run(["pdal", "info", "--metadata", dest], capture_output=True, text=True)
+            return None if p.returncode == 0 else f"unreadable LAZ: {p.stderr.strip()[-200:]}"
+        return check_raster(dest, *raster_shape(prod, rois[roi]))
+
+    todo = [(r, p, out_path(out, r, p)) for r in roi_ids for p in products]
+    todo = [t for t in todo if os.path.exists(t[2])]
+    print(f"checking {len(todo)} existing files", file=sys.stderr)
+    bad = []
+    with ThreadPoolExecutor(workers) as ex:
+        futs = {ex.submit(check, *t): t for t in todo}
+        for f in as_completed(futs):
+            roi, prod, dest = futs[f]
+            err = f.result()
+            if err:
+                bad.append(f"{roi}\t{prod}\t{err}")
+                os.remove(dest)
+                print(f"BAD {roi} {prod}: {err} (deleted)", file=sys.stderr)
+    print(f"{len(bad)} broken files deleted", file=sys.stderr)
+    return bad
+
+
+def estimate(jobs, rois, roi_laz_tiles, laz_size, cache_dir):
+    """Bytes to transfer for the pending jobs: WMS responses are uncompressed GeoTIFF."""
+    per_prod = defaultdict(lambda: [0, 0])
+    for roi, prod, _ in jobs:
+        per_prod[prod][0] += 1
+        if prod in RASTERS:
+            w, h = raster_shape(prod, rois[roi])
+            per_prod[prod][1] += w * h * (4 if prod != "irc" else 3)
+    tiles = {t for ts in roi_laz_tiles.values() for t in ts
+             if not os.path.exists(os.path.join(cache_dir, f"{t}.copc.laz"))}
+    known = [laz_size[t] for t in laz_size if laz_size[t]]
+    mean = sum(known) / len(known) if known else 130e6
+    per_prod["laz"][1] = sum(laz_size.get(t) or mean for t in tiles)
+    for prod, (n, size) in sorted(per_prod.items()):
+        if n:
+            extra = f" ({len(tiles)} full tiles)" if prod == "laz" else ""
+            print(f"{prod}: {n} files missing, ~{human_bytes(size)} to download{extra}")
+    print(f"total: ~{human_bytes(sum(s for n, s in per_prod.values() if n))} to download")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default=FLAIR_DATA, help="FLAIR-HUB data dir (contains GLOBAL_ALL_MTD.zip)")
@@ -229,10 +326,17 @@ def main():
     ap.add_argument("--limit", type=int, help="only the first N ROIs (testing)")
     ap.add_argument("--workers", type=int, default=3)
     ap.add_argument("--min-free-gb", type=float, default=20, help="skip LAZ jobs below this free disk space")
+    ap.add_argument("--check-existing", action="store_true",
+                    help="verify already downloaded files first and delete broken ones (re-fetched by this run)")
+    ap.add_argument("--dry-run", action="store_true", help="only report what is missing and the volume to download")
     args = ap.parse_args()
 
+    laz_url, laz_size = {}, {}
     with open(args.tiles) as fh:
-        laz_url = {r["tile"]: r["url_laz"] for r in csv.DictReader(fh) if r["url_laz"]}
+        for r in csv.DictReader(fh):
+            if r["url_laz"]:
+                laz_url[r["tile"]] = r["url_laz"]
+                laz_size[r["tile"]] = int(r["laz_bytes"]) if r["laz_bytes"] else None
 
     rois = read_rois(args.data)
     if args.domains:
@@ -240,6 +344,12 @@ def main():
     if args.rois:
         rois = {k: v for k, v in rois.items() if k in args.rois}
     roi_ids = sorted(rois)[: args.limit] if args.limit else sorted(rois)
+
+    if args.check_existing:
+        bad = check_existing(roi_ids, rois, args.products, args.out, args.workers)
+        if bad:
+            with open(os.path.join(args.out, "failed.txt"), "a") as fh:
+                fh.write("\n".join(bad) + "\n")
 
     jobs = []
     for roi in roi_ids:
@@ -256,6 +366,9 @@ def main():
         for t in tiles:
             refs[t] += 1
     cache = TileCache(os.path.join(args.out, "_tiles_cache"), laz_url, refs)
+    if args.dry_run:
+        estimate(jobs, rois, roi_laz_tiles, laz_size, cache.dir)
+        return
 
     def run(roi, prod, dest):
         os.makedirs(os.path.dirname(dest), exist_ok=True)
