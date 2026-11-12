@@ -32,7 +32,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # FLAIR-HUB "data" folder (the one holding GLOBAL_ALL_MTD.zip); override with $FLAIR_HUB_DATA
-FLAIR_DATA = os.environ.get("FLAIR_HUB_DATA", "/Volumes/SAMSUNG/sylvain/huggingface/FLAIR-HUB/data")
+FLAIR_DATA = os.environ.get("FLAIR_HUB_DATA", "/Volumes/Programming/huggingface/FLAIR-HUB/data")
 OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 WFS_URL = "https://data.geopf.fr/wfs/ows"
 WFS_LAYER = "IGNF_LIDAR-HD_METADONNEE:metadata"
@@ -53,7 +53,15 @@ def human_bytes(num):
 
 
 def read_rois(data_dir):
-    """Return {ROI_id: (xmin, ymin, xmax, ymax)} from the global geometry metadata."""
+    """Return {ROI_id: (xmin, ymin, xmax, ymax)} from the global geometry metadata.
+
+    data_dir may also be a CSV with ROI_id,xmin,ymin,xmax,ymax columns (pipeline/rois.csv), which
+    is what the GitHub Actions pipeline uses instead of the 10 GB FLAIR-HUB metadata zip.
+    """
+    if data_dir.endswith(".csv"):
+        with open(data_dir) as fh:
+            return {r["ROI_id"]: tuple(float(r[k]) for k in ("xmin", "ymin", "xmax", "ymax"))
+                    for r in csv.DictReader(fh)}
     gpkg = f"/vsizip/{data_dir}/GLOBAL_ALL_MTD.zip/GLOBAL_ALL_MTD/GLOBAL_ALL_MTD_GEOM.gpkg"
     sql = ("SELECT ROI_id, MIN(patch_xmin) xmin, MIN(patch_ymin) ymin, "
            "MAX(patch_xmax) xmax, MAX(patch_ymax) ymax "

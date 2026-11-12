@@ -9,7 +9,7 @@
 # Logs: $OUT/resume.log (OUT = data_lidar next to the FLAIR-HUB data folder).
 set -u
 cd "$(dirname "$0")"
-DATA=${FLAIR_HUB_DATA:-/Volumes/SAMSUNG/sylvain/huggingface/FLAIR-HUB/data}
+DATA=${FLAIR_HUB_DATA:-/Volumes/Programming/huggingface/FLAIR-HUB/data}
 OUT=$(dirname "$DATA")/data_lidar
 PRODUCTS=${PRODUCTS:-"mnt mns irc"}
 LOG=$OUT/resume.log

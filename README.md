@@ -52,6 +52,7 @@ They enrich every one of the 2,822 [FLAIR-HUB](https://huggingface.co/datasets/I
 | `download_vectors.py` | Corine Land Cover and vegetation polygons clipped to each ROI |
 | `download_osm.py` | OpenStreetMap land cover and lines from the Overpass API, clipped to each ROI |
 | `resume.sh` | Reports what is missing, verifies files on disk, re-fetches broken or missing ones |
+| `pipeline.py` + `.github/workflows/pipeline.yml` | Same downloads, run on GitHub Actions: crop, zip, upload to the Hub, delete, next |
 | `package_hf.py` | Zips per domain and product (FLAIR-HUB layout), metadata and licences for Hugging Face |
 | `upload_hf.sh` | Uploads the packaged folder to the Hub |
 
@@ -94,6 +95,35 @@ Every step is resumable: re-running skips finished files, and failures are liste
 `--check-existing` re-reads every file on disk and re-fetches the broken ones; `./resume.sh` does both
 for every product.
 Use `--domains D004 D013` or `--limit 3` to try a subset.
+
+## Running on GitHub Actions
+
+The full dataset means ~1.5 TB of downloads from IGN, too much for a metered connection. The
+`pipeline` workflow does the work on GitHub's runners instead, with the same download and crop
+code:
+
+- A **unit** is one zip of the dataset: one FLAIR-HUB domain × one product (`LIDARHD_LAZ`, `_MNT`,
+  `_MNS`, `_MNH`, `BDORTHO_IRC`), 370 units in total.
+- The first run writes `todo.txt` on the `pipeline-state` branch: every unit not already on the Hub.
+- Each run takes units from the top of the list. For each one, it crops every ROI and appends it to
+  the zip, deleting the crop straight away (peak disk ≈ biggest zip + ~8 GB of tiles, at most ~30 GB).
+  It then verifies the zip, uploads it to the Hub, deletes it, and moves the unit to `done.txt`. The
+  state branch is committed after every unit, so a cancelled run loses at most one unit.
+- A run only starts a unit that fits in its time budget (300 min by default), then launches the next
+  run itself. A unit that fails is retried at the end of the list, and dropped to `failed.txt` after
+  3 attempts. The chain stops when the list is empty, or after 3 runs in a row finish nothing.
+
+```bash
+gh secret set HF_TOKEN              # once: a Hugging Face token with write access (pasted at the prompt)
+gh workflow run pipeline.yml        # start; the runs chain until todo is empty
+gh run list --workflow pipeline.yml # follow
+git fetch origin pipeline-state && git show origin/pipeline-state:done.txt | tail
+```
+
+The runner reads ROI extents and LAZ tile URLs from `pipeline/rois.csv` and
+`pipeline/laz_tiles.csv` (regenerate with `python3 pipeline.py export-inputs`), so it never
+downloads FLAIR-HUB itself. To test one unit locally without uploading:
+`python3 pipeline.py run --state /tmp/s --work /tmp/w --units D080-2017_LIDARHD_MNH --no-upload`.
 
 ## How the data are cropped
 
@@ -138,7 +168,7 @@ Use `--domains D004 D013` or `--limit 3` to try a subset.
 - [x] IRC orthophotos per ROI
 - [ ] OpenStreetMap land cover per ROI (script ready, download pending)
 - [ ] LiDAR point clouds per ROI (2,384 / 2,706 covered ROIs done)
-- [ ] Hugging Face upload of every product (MNT, MNS, vectors done; IRC uploading)
+- [ ] Hugging Face upload of every product: MNT, MNS and vectors done; LAZ, MNH and IRC built on GitHub Actions (`pipeline.yml`)
 - [ ] Training targets: Corine classes rasterised on the FLAIR-HUB grid, reconciled with FLAIR-HUB labels
 - [ ] Land-cover classification model (imagery + NIR + LiDAR height)
 - [ ] Cartographic rendering pipeline (relief shading, land-cover generalisation, IGN / swisstopo-like style)

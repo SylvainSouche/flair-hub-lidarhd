@@ -1,0 +1,92 @@
+# Builds the Hugging Face dataset on GitHub's runners (see pipeline.py): each run takes units
+# from the todo list on the `pipeline-state` branch, downloads and crops them, uploads the zips,
+# moves them to done, and starts the next run before the 6 h job limit.
+#
+# Start:   gh workflow run pipeline.yml            (first run creates the todo list)
+# Rebuild the todo list:  gh workflow run pipeline.yml -f init=true
+# Stop the chain: gh workflow run pipeline.yml -f chain=false, or disable the workflow.
+# Needs the repository secret HF_TOKEN (a Hugging Face token with write access).
+name: pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      budget_minutes:
+        description: Minutes of work per run (the job limit is 6 h)
+        default: "300"
+      max_units:
+        description: Stop after this many units (0 = no limit)
+        default: "0"
+      init:
+        description: Rebuild the todo list from what is on the Hub
+        type: boolean
+        default: false
+      chain:
+        description: Start the next run when this one ends
+        type: boolean
+        default: true
+
+concurrency:
+  group: pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # push the state branch
+  actions: write    # start the next run
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: State branch
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin pipeline-state >/dev/null; then
+            git fetch -q origin pipeline-state
+            git worktree add -B pipeline-state state origin/pipeline-state
+          else
+            git worktree add --orphan -b pipeline-state state
+          fi
+
+      - name: Work disk
+        # /mnt is the runner's large temporary disk (~70 GB); the biggest unit needs ~30 GB
+        run: |
+          sudo mkdir -p /mnt/work && sudo chown "$USER" /mnt/work
+          df -h / /mnt
+
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: flair
+          create-args: python=3.12 gdal pdal huggingface_hub
+          init-shell: bash
+          cache-environment: true
+
+      - name: Init todo list
+        if: inputs.init || hashFiles('state/todo.txt') == ''
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python pipeline.py init --state state --git-push
+
+      - name: Run
+        id: run
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python pipeline.py run --state state --work /mnt/work --git-push \
+            --budget-min "${{ inputs.budget_minutes }}" --max-units "${{ inputs.max_units }}"
+          python pipeline.py status --state state >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Start next run
+        if: steps.run.outputs.continue == 'true' && inputs.chain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run pipeline.yml --ref "${{ github.ref_name }}" \
+            -f budget_minutes="${{ inputs.budget_minutes }}" -f max_units="${{ inputs.max_units }}" -f chain=true
